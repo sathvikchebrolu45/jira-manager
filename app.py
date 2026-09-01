@@ -1,6 +1,8 @@
 import streamlit as st
 import requests
 import json
+import re
+import pandas as pd
 from datetime import datetime, timedelta
 from requests.auth import HTTPBasicAuth
 
@@ -51,13 +53,13 @@ jira_token = st.sidebar.text_input(
 )
 
 col_save, col_clear = st.sidebar.columns(2)
-if col_save.button("💾 Remember", use_container_width=True, help="Save credentials for this browser session"):
+if col_save.button("💾 Remember", width="stretch", help="Save credentials for this browser session"):
     st.session_state["jira_email"] = jira_email
     st.session_state["jira_token"] = jira_token
     st.session_state["creds_saved"] = True
     st.sidebar.success("✅ Saved for this session!")
 
-if col_clear.button("🗑️ Clear", use_container_width=True, help="Remove saved credentials"):
+if col_clear.button("🗑️ Clear", width="stretch", help="Remove saved credentials"):
     st.session_state["jira_email"] = ""
     st.session_state["jira_token"] = ""
     st.session_state["creds_saved"] = False
@@ -114,8 +116,115 @@ def validate_credentials():
     st.error(f"❌ Authentication failed ({resp.status_code}). Check your email / token.")
     return False
 
+def normalize_column_name(value):
+    return re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower()).strip("_")
+
+def read_story_upload(uploaded_file):
+    dataframe = pd.read_excel(uploaded_file)
+    aliases = {
+        "board_name": {"board", "board_name", "boardname"},
+        "summary": {"summary", "title"},
+        "priority": {"priority"},
+        "parent_issue": {"parent", "parent_issue", "parent_key"},
+        "description": {"description", "desc"},
+        "assignee_email": {"assignee", "assignee_email", "assignee_mail"},
+        "story_points": {"story_points", "story_point", "points"},
+    }
+    normalized = {}
+    for column in dataframe.columns:
+        normalized_name = normalize_column_name(column)
+        for target, accepted_names in aliases.items():
+            if normalized_name in accepted_names and target not in normalized:
+                normalized[target] = column
+                break
+
+    missing = [name for name in ("summary",) if name not in normalized]
+    if missing:
+        raise ValueError("Required column missing: Summary")
+
+    rows = []
+    for row_number, (_, row) in enumerate(dataframe.iterrows(), start=2):
+        get_value = lambda name: str(row[normalized[name]]).strip() if name in normalized and pd.notna(row[normalized[name]]) else ""
+        if not get_value("summary"):
+            continue
+        rows.append({
+            "row_number": row_number,
+            "board_name": get_value("board_name"),
+            "summary": get_value("summary"),
+            "priority": get_value("priority") or "Medium",
+            "parent_key": get_value("parent_issue"),
+            "description": get_value("description"),
+            "assignee_email": get_value("assignee_email"),
+            "story_points": get_value("story_points"),
+        })
+    return rows
+
+def canonical_priority(value):
+    priorities = {"highest", "high", "medium", "low", "lowest"}
+    value = value.strip().lower()
+    return next((item.title() for item in priorities if item == value), "Medium")
+
+def validate_board_name(value):
+    if not value:
+        return
+    known_boards = {name.casefold() for name in BOARDS}
+    if value.casefold() not in known_boards:
+        raise ValueError(f"Unknown board name: {value}")
+
+def create_story(email, token, story):
+    validate_board_name(story["board_name"])
+    payload = {
+        "fields": {
+            "project": {"key": JIRA_PROJECT},
+            "summary": story["summary"],
+            "issuetype": {"name": "Story"},
+            "priority": {"name": canonical_priority(story["priority"])},
+            "description": {
+                "type": "doc",
+                "version": 1,
+                "content": [{"type": "paragraph", "content": [{"type": "text", "text": story["description"] or " "}]}],
+            },
+        }
+    }
+
+    if story["story_points"]:
+        sp_field = get_story_points_field(email, token)
+        try:
+            story_points = float(story["story_points"])
+        except ValueError:
+            story_points = 0
+        if sp_field and story_points:
+            payload["fields"][sp_field] = story_points
+
+    if story["parent_key"]:
+        payload["fields"]["parent"] = {"key": story["parent_key"].upper()}
+
+    if story["assignee_email"]:
+        user_resp = requests.get(
+            f"{JIRA_BASE_URL}/rest/api/3/user/search",
+            params={"query": story["assignee_email"]},
+            auth=HTTPBasicAuth(email, token),
+            headers={"Accept": "application/json"},
+            timeout=10,
+        )
+        if user_resp.status_code == 200 and user_resp.json():
+            payload["fields"]["assignee"] = {"accountId": user_resp.json()[0]["accountId"]}
+
+    response = requests.post(
+        f"{JIRA_BASE_URL}/rest/api/3/issue",
+        auth=HTTPBasicAuth(email, token),
+        headers={"Accept": "application/json", "Content-Type": "application/json"},
+        json=payload,
+        timeout=15,
+    )
+    if response.status_code != 201:
+        raise RuntimeError(response.text)
+    return response.json()
+
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3 = st.tabs(["📝 Create Stories", "📊 Jira Data Sync", "🗑️ Delete Tickets"])
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["📝 Create Stories", "📊 Jira Data Sync", "🗑️ Delete Tickets", "📈 Manager Dashboard"]
+)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 1 – CREATE STORIES
@@ -124,6 +233,46 @@ with tab1:
     st.header("📝 Create Jira Stories")
     st.caption(f"Board: **{selected_board_name}** — [Open in Jira]({board_url})")
 
+    st.subheader("Create from Excel")
+    uploaded_file = st.file_uploader("Upload an Excel sheet", type=["xlsx", "xls"], key="story_upload")
+    if uploaded_file:
+        try:
+            uploaded_stories = read_story_upload(uploaded_file)
+        except (KeyError, TypeError, ValueError, ImportError) as error:
+            st.error(f"❌ Could not read the Excel sheet: {error}")
+            uploaded_stories = []
+
+        if uploaded_stories:
+            st.dataframe(
+                pd.DataFrame(uploaded_stories).drop(columns=["row_number"]),
+                width="stretch",
+                hide_index=True,
+            )
+            if st.button("🚀 Create Uploaded Stories", type="primary", width="stretch"):
+                if not validate_credentials():
+                    st.stop()
+                created, failed = [], []
+                with st.spinner("Creating Jira stories..."):
+                    for story in uploaded_stories:
+                        try:
+                            data = create_story(jira_email, jira_token, story)
+                            created.append((story, data))
+                        except (KeyError, requests.RequestException, RuntimeError, ValueError) as error:
+                            failed.append((story, str(error)))
+                if created:
+                    st.success(f"✅ Created {len(created)} ticket(s).")
+                    for story, data in created:
+                        key = data["key"]
+                        st.markdown(f"- **[{key}]({JIRA_BASE_URL}/browse/{key})** — {story['summary']}")
+                if failed:
+                    st.error(f"❌ {len(failed)} row(s) failed.")
+                    for story, error in failed:
+                        st.write(f"Row {story['row_number']} — {story['summary']}: {error}")
+        else:
+            st.warning("No rows with a Summary value were found.")
+
+    st.divider()
+    st.subheader("Create manually")
     # ── How many stories? ────────────────────────────────────────────────────
     num_stories = st.number_input("Number of stories to create", min_value=1, max_value=20, value=1, step=1)
 
@@ -160,7 +309,11 @@ with tab1:
             sp_label = st.selectbox(f"Story Points #{i+1} — How much effort does this task require?", options=list(sp_options.keys()), key=f"sp_{i}")
             story_points = sp_options[sp_label]
         with col4:
-            assignee_email = st.text_input(f"Assignee Email #{i+1} (optional)", key=f"assignee_{i}", placeholder="assignee@example.com")
+            assignee_email = st.text_input(
+                f"Assignee Email #{i+1} (optional)",
+                key=f"assignee_{i}",
+                placeholder="assignee@example.com",
+            )
 
         stories.append({
             "summary": summary,
@@ -172,7 +325,7 @@ with tab1:
         })
 
     st.divider()
-    if st.button("🚀 Create Stories in Jira", type="primary", use_container_width=True):
+    if st.button("🚀 Create Stories in Jira", type="primary", width="stretch"):
         if not validate_credentials():
             st.stop()
 
@@ -291,19 +444,28 @@ with tab2:
 
     max_results = st.slider("Max results", min_value=10, max_value=500, value=100, step=10)
 
-    if st.button("🔄 Sync Jira Data", type="primary", use_container_width=True):
+    parent_filter = st.text_input(
+        "Filter by Parent Issue (optional)",
+        placeholder="e.g. MID1-1221",
+        help="Only fetch child issues under this parent/epic key. Leave empty to fetch all.",
+    )
+
+    if st.button("🔄 Sync Jira Data", type="primary", width="stretch"):
         if not validate_credentials():
             st.stop()
 
         # Build JQL
         type_clause   = " OR ".join([f'issuetype = "{t}"' for t in issue_types]) if issue_types else 'issuetype in standardIssueTypes()'
         status_clause = (" AND (" + " OR ".join([f'status = "{s}"' for s in statuses]) + ")") if statuses else ""
+        parent_clause = f' AND parent = {parent_filter.strip().upper()}' if parent_filter.strip() else ""
+        # Skip date filter when parent is specified — child issues may fall outside the range
+        date_clause   = (f' AND created >= "{start_date}" AND created <= "{end_date}"') if not parent_filter.strip() else ""
         jql = (
             f'project = {JIRA_PROJECT}'
             f' AND ({type_clause})'
-            f' AND created >= "{start_date}"'
-            f' AND created <= "{end_date}"'
+            f'{date_clause}'
             f'{status_clause}'
+            f'{parent_clause}'
             f' ORDER BY created DESC'
         )
 
@@ -351,7 +513,7 @@ with tab2:
         if issues:
             import pandas as pd
             df = pd.DataFrame(issues)[["key", "summary", "issuetype", "status", "priority", "assignee", "created"]]
-            st.dataframe(df, use_container_width=True)
+            st.dataframe(df, width="stretch")
 
         # JSON output
         with st.expander("🗂️ Full JSON Output", expanded=True):
@@ -363,7 +525,7 @@ with tab2:
             data=json_str,
             file_name=f"jira_{JIRA_PROJECT}_{start_date}_{end_date}.json",
             mime="application/json",
-            use_container_width=True,
+            width="stretch",
         )
 
         # JQL used — helpful for debugging
@@ -391,7 +553,7 @@ with tab3:
         help="One ticket key per line",
     )
 
-    if st.button("🔍 Preview Tickets", use_container_width=True):
+    if st.button("🔍 Preview Tickets", width="stretch"):
         if not validate_credentials():
             st.stop()
 
@@ -444,13 +606,13 @@ with tab3:
                  "Status": v["status"], "Assignee": v["assignee"]}
                 for v in found.values()
             ])
-            st.dataframe(df_del, use_container_width=True)
+            st.dataframe(df_del, width="stretch")
 
             st.error(f"You are about to **permanently delete {len(found)} ticket(s)**. This cannot be undone.")
             confirm = st.checkbox("✅ I understand, proceed with deletion")
 
             if confirm:
-                if st.button("🗑️ Delete Tickets", type="primary", use_container_width=True):
+                if st.button("🗑️ Delete Tickets", type="primary", width="stretch"):
                     if not validate_credentials():
                         st.stop()
 
@@ -478,3 +640,153 @@ with tab3:
                     # Clear preview after deletion
                     st.session_state["delete_preview"] = {}
                     st.session_state["tickets_to_delete"] = []
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 4 – MANAGER DASHBOARD
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab4:
+    st.header("📈 Manager Dashboard")
+    st.caption(f"Overview for project **{JIRA_PROJECT}**. [Open in Jira]({board_url})")
+
+    dash_col1, dash_col2 = st.columns(2)
+    with dash_col1:
+        dash_start = st.date_input("From date", value=datetime.today() - timedelta(days=90), key="dash_start")
+    with dash_col2:
+        dash_end = st.date_input("To date", value=datetime.today(), key="dash_end")
+
+    if st.button("🔄 Load Dashboard", type="primary", width="stretch", key="dash_load"):
+        if not validate_credentials():
+            st.stop()
+
+        jql = (
+            f'project = {JIRA_PROJECT}'
+            f' AND issuetype in ("Epic", "Story", "Bug", "Task", "Sub-task")'
+            f' AND created >= "{dash_start}" AND created <= "{dash_end}"'
+            f' ORDER BY created DESC'
+        )
+
+        all_issues, next_page_token = [], None
+        with st.spinner("Fetching data from Jira..."):
+            while True:
+                body = {
+                    "jql": jql,
+                    "maxResults": 100,
+                    "fields": ["summary", "issuetype", "status", "priority", "assignee", "parent", "created", "resolutiondate"],
+                }
+                if next_page_token:
+                    body["nextPageToken"] = next_page_token
+                resp = requests.post(
+                    f"{JIRA_BASE_URL}/rest/api/3/search/jql",
+                    auth=get_auth(),
+                    headers={"Accept": "application/json", "Content-Type": "application/json"},
+                    json=body,
+                    timeout=30,
+                )
+                if resp.status_code != 200:
+                    st.error(f"❌ Failed to fetch data: {resp.status_code}\n{resp.text}")
+                    st.stop()
+                raw = resp.json()
+                all_issues.extend(raw.get("issues", []))
+                next_page_token = raw.get("nextPageToken")
+                if not next_page_token or len(all_issues) >= 1000:
+                    break
+
+        issues = []
+        for issue in all_issues:
+            f = issue.get("fields", {})
+            status = f.get("status", {}) or {}
+            issues.append({
+                "key":        issue["key"],
+                "summary":    f.get("summary"),
+                "type":       f.get("issuetype", {}).get("name") if f.get("issuetype") else "Unknown",
+                "status":     status.get("name", "Unknown"),
+                "is_done":    (status.get("statusCategory", {}) or {}).get("key") == "done",
+                "priority":   f.get("priority", {}).get("name") if f.get("priority") else "None",
+                "assignee":   f.get("assignee", {}).get("displayName") if f.get("assignee") else "Unassigned",
+                "parent":     f.get("parent", {}).get("key") if f.get("parent") else None,
+                "created":    (f.get("created") or "")[:10],
+            })
+
+        if not issues:
+            st.warning("⚠️ No issues found for the selected date range.")
+            st.stop()
+
+        df = pd.DataFrame(issues)
+
+        epics  = df[df["type"] == "Epic"]
+        stories = df[df["type"].isin(["Story", "Bug", "Task", "Sub-task"])]
+
+        open_count   = int((~df["is_done"]).sum())
+        closed_count = int(df["is_done"].sum())
+
+        # ── KPI cards ─────────────────────────────────────────────────────
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Total Issues", len(df))
+        k2.metric("Epics", len(epics))
+        k3.metric("Stories/Tasks/Bugs", len(stories))
+        k4.metric("🟢 Open", open_count)
+        k5.metric("✅ Closed", closed_count)
+
+        st.divider()
+
+        # ── Status & type breakdown ──────────────────────────────────────
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("Status Breakdown")
+            st.bar_chart(df["status"].value_counts())
+        with c2:
+            st.subheader("Issue Type Breakdown")
+            st.bar_chart(df["type"].value_counts())
+
+        st.divider()
+
+        # ── Epic progress ────────────────────────────────────────────────
+        st.subheader("📦 Epic Progress")
+        if epics.empty:
+            st.info("No epics found in this date range.")
+        else:
+            epic_rows = []
+            for _, epic in epics.iterrows():
+                children = df[df["parent"] == epic["key"]]
+                total_children = len(children)
+                done_children = int(children["is_done"].sum())
+                pct = round((done_children / total_children * 100), 1) if total_children else 0.0
+                epic_rows.append({
+                    "Epic":       epic["key"],
+                    "Summary":    epic["summary"],
+                    "Status":     epic["status"],
+                    "Total Items": total_children,
+                    "Done":       done_children,
+                    "Open":       total_children - done_children,
+                    "% Complete": pct,
+                })
+            epic_df = pd.DataFrame(epic_rows)
+            st.dataframe(
+                epic_df,
+                width="stretch",
+                column_config={
+                    "% Complete": st.column_config.ProgressColumn(
+                        "% Complete", min_value=0, max_value=100, format="%.1f%%"
+                    )
+                },
+            )
+
+        st.divider()
+
+        # ── Workload by assignee ─────────────────────────────────────────
+        st.subheader("👤 Open Work by Assignee")
+        open_df = df[~df["is_done"]]
+        if open_df.empty:
+            st.info("No open issues 🎉")
+        else:
+            st.bar_chart(open_df["assignee"].value_counts())
+
+        st.divider()
+
+        # ── Raw table ─────────────────────────────────────────────────────
+        with st.expander("🗂️ All Issues"):
+            st.dataframe(
+                df[["key", "type", "summary", "status", "priority", "assignee", "created"]],
+                width="stretch",
+            )
