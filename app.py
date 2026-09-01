@@ -13,6 +13,75 @@ st.set_page_config(
     layout="wide",
 )
 
+# ── Manager Dashboard styling (KPI cards, badges, progress bars) ─────────────
+st.markdown("""
+<style>
+.kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 12px;
+    margin-bottom: 1.5rem;
+}
+.kpi-card {
+    background: rgba(255,255,255,0.03);
+    border-radius: 8px;
+    border: 1px solid rgba(128,128,128,0.25);
+    padding: 1rem;
+    text-align: center;
+}
+.kpi-label {
+    font-size: 12px;
+    opacity: 0.7;
+    margin-bottom: 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+.kpi-value { font-size: 32px; font-weight: 700; }
+.kpi-stale { border-left: 4px solid #f59e0b; }
+.kpi-blocked { border-left: 4px solid #ef4444; }
+.kpi-open { border-left: 4px solid #3b82f6; }
+.kpi-closed { border-left: 4px solid #10b981; }
+.badge {
+    font-size: 11px;
+    padding: 3px 10px;
+    border-radius: 4px;
+    font-weight: 600;
+    display: inline-block;
+    margin-right: 6px;
+}
+.badge-stale { background: #fef3c7; color: #92400e; }
+.badge-blocked { background: #fee2e2; color: #7f1d1d; }
+.epics-overview { margin-top: 0.5rem; }
+.epic-row {
+    border-bottom: 1px solid rgba(128,128,128,0.25);
+    padding: 16px 4px;
+}
+.epic-row:last-child { border-bottom: none; }
+.epic-row.stale-left-border { border-left: 3px solid #f59e0b; padding-left: 12px; }
+.epic-row.blocked-left-border { border-left: 3px solid #ef4444; padding-left: 12px; }
+.epic-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
+.epic-title { font-weight: 600; font-size: 15px; margin-bottom: 4px; }
+.epic-badges { margin-top: 6px; margin-bottom: 4px; }
+.epic-meta { font-size: 13px; opacity: 0.65; margin-top: 4px; }
+.epic-completion { text-align: right; min-width: 90px; }
+.epic-percentage { font-size: 18px; font-weight: 700; }
+.epic-done { font-size: 12px; opacity: 0.65; margin-top: 3px; }
+.progress-bar {
+    width: 100%;
+    height: 8px;
+    background: rgba(128,128,128,0.25);
+    border-radius: 4px;
+    overflow: hidden;
+    margin-top: 10px;
+}
+.progress-fill { height: 100%; border-radius: 4px; }
+.progress-fill-done { background: #10b981; }
+.progress-fill-in-progress { background: #f59e0b; }
+.progress-fill-pending { background: #3b82f6; }
+.empty-state { text-align: center; padding: 2rem; opacity: 0.6; }
+</style>
+""", unsafe_allow_html=True)
+
 JIRA_BASE_URL = "https://maersk-tools.atlassian.net"
 JIRA_PROJECT  = "MID1"
 
@@ -70,19 +139,81 @@ if st.session_state["creds_saved"]:
     st.sidebar.caption("🟢 Credentials remembered for this session")
 
 # ── Sidebar – board selector ──────────────────────────────────────────────────
+ALL_BOARDS_LABEL = "🌐 All Boards (combined)"
+
 st.sidebar.divider()
 st.sidebar.title("📋 Board")
 selected_board_name = st.sidebar.selectbox(
     "Select Board",
-    options=list(BOARDS.keys()),
+    options=[ALL_BOARDS_LABEL] + list(BOARDS.keys()),
     index=0,
 )
-selected_board_id = BOARDS[selected_board_name]
-board_url = f"{JIRA_BASE_URL}/jira/software/c/projects/{JIRA_PROJECT}/boards/{selected_board_id}"
+selected_board_id = BOARDS.get(selected_board_name)  # None when "All Boards" is selected
+if selected_board_id:
+    board_url = f"{JIRA_BASE_URL}/jira/software/c/projects/{JIRA_PROJECT}/boards/{selected_board_id}"
+else:
+    board_url = f"{JIRA_BASE_URL}/jira/software/projects/{JIRA_PROJECT}/boards"
 st.sidebar.caption(f"[🔗 Open board]({board_url})")
 
 def get_auth():
     return HTTPBasicAuth(jira_email, jira_token)
+
+def fetch_board_issues(auth, board_id, jql_clause, fields, max_results=1000):
+    """Fetch issues for the given board_id (agile board API), or across the whole
+    project when board_id is None (the "All Boards" selection), paginating either way.
+    Returns (issues, error_response) — error_response is None on success."""
+    issues = []
+    if board_id is None:
+        jql = f'project = {JIRA_PROJECT} AND {jql_clause}'
+        next_page_token = None
+        while True:
+            body = {
+                "jql":        jql,
+                "maxResults": min(100, max_results - len(issues)),
+                "fields":     fields.split(","),
+            }
+            if next_page_token:
+                body["nextPageToken"] = next_page_token
+            resp = requests.post(
+                f"{JIRA_BASE_URL}/rest/api/3/search/jql",
+                auth=auth,
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
+                json=body,
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                return issues, resp
+            raw = resp.json()
+            batch = raw.get("issues", [])
+            issues.extend(batch)
+            next_page_token = raw.get("nextPageToken")
+            if not next_page_token or not batch or len(issues) >= max_results:
+                break
+        return issues, None
+    else:
+        start_at = 0
+        while True:
+            resp = requests.get(
+                f"{JIRA_BASE_URL}/rest/agile/1.0/board/{board_id}/issue",
+                auth=auth,
+                headers={"Accept": "application/json"},
+                params={
+                    "jql":        jql_clause,
+                    "startAt":    start_at,
+                    "maxResults": min(100, max_results - len(issues)),
+                    "fields":     fields,
+                },
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                return issues, resp
+            raw = resp.json()
+            batch = raw.get("issues", [])
+            issues.extend(batch)
+            start_at += len(batch)
+            if raw.get("isLast", True) or not batch or len(issues) >= max_results:
+                break
+        return issues, None
 
 @st.cache_data(show_spinner=False)
 def get_story_points_field(email, token):
@@ -454,41 +585,37 @@ with tab2:
         if not validate_credentials():
             st.stop()
 
-        # Build JQL
+        # Build JQL — scoped to the selected board via the agile API below,
+        # so switching boards in the sidebar actually changes what gets fetched here.
         type_clause   = " OR ".join([f'issuetype = "{t}"' for t in issue_types]) if issue_types else 'issuetype in standardIssueTypes()'
         status_clause = (" AND (" + " OR ".join([f'status = "{s}"' for s in statuses]) + ")") if statuses else ""
         parent_clause = f' AND parent = {parent_filter.strip().upper()}' if parent_filter.strip() else ""
         # Skip date filter when parent is specified — child issues may fall outside the range
         date_clause   = (f' AND created >= "{start_date}" AND created <= "{end_date}"') if not parent_filter.strip() else ""
         jql = (
-            f'project = {JIRA_PROJECT}'
-            f' AND ({type_clause})'
+            f'({type_clause})'
             f'{date_clause}'
             f'{status_clause}'
             f'{parent_clause}'
             f' ORDER BY created DESC'
         )
 
-        with st.spinner("Fetching data from Jira..."):
-            resp = requests.post(
-                f"{JIRA_BASE_URL}/rest/api/3/search/jql",
-                auth=get_auth(),
-                headers={"Accept": "application/json", "Content-Type": "application/json"},
-                json={
-                    "jql":        jql,
-                    "maxResults": max_results,
-                    "fields":     ["summary", "status", "issuetype", "priority", "assignee", "reporter", "created", "updated", "labels", "components"],
-                },
-                timeout=30,
+        all_issues, total = [], 0
+        with st.spinner(f"Fetching data from {selected_board_name}..."):
+            all_issues, err_resp = fetch_board_issues(
+                get_auth(),
+                selected_board_id,
+                jql,
+                "summary,status,issuetype,priority,assignee,reporter,created,updated,labels,components",
+                max_results=max_results,
             )
+            if err_resp is not None:
+                st.error(f"❌ Failed to fetch data: {err_resp.status_code}\n{err_resp.text}")
+                st.stop()
+            total = len(all_issues)
 
-        if resp.status_code != 200:
-            st.error(f"❌ Failed to fetch data: {resp.status_code}\n{resp.text}")
-            st.stop()
-
-        raw = resp.json()
         issues = []
-        for issue in raw.get("issues", []):
+        for issue in all_issues:
             f = issue.get("fields", {})
             issues.append({
                 "key":         issue["key"],
@@ -506,8 +633,7 @@ with tab2:
                 "updated":     f.get("updated"),
             })
 
-        total = raw.get("total", 0)
-        st.success(f"✅ Fetched {len(issues)} of {total} total matching issues.")
+        st.success(f"✅ Fetched {len(issues)} matching issues on **{selected_board_name}**.")
 
         # Summary table
         if issues:
@@ -647,86 +773,117 @@ with tab3:
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab4:
     st.header("📈 Manager Dashboard")
-    st.caption(f"Overview for project **{JIRA_PROJECT}**. [Open in Jira]({board_url})")
+    st.caption(f"Overview for board **{selected_board_name}** — project **{JIRA_PROJECT}**. [Open in Jira]({board_url})")
 
-    dash_col1, dash_col2 = st.columns(2)
+    dash_col1, dash_col2, dash_col3 = st.columns(3)
     with dash_col1:
         dash_start = st.date_input("From date", value=datetime.today() - timedelta(days=90), key="dash_start")
     with dash_col2:
         dash_end = st.date_input("To date", value=datetime.today(), key="dash_end")
+    with dash_col3:
+        stale_days = st.number_input(
+            "Stale threshold (days)", min_value=1, max_value=90, value=7, key="dash_stale_days",
+            help="Issues in In Progress/Blocked with no update for this many days are flagged Stale.",
+        )
 
     if st.button("🔄 Load Dashboard", type="primary", width="stretch", key="dash_load"):
         if not validate_credentials():
             st.stop()
 
+        # Scope the query to the currently selected board (not just the project),
+        # so switching boards in the sidebar actually changes what the dashboard shows.
         jql = (
-            f'project = {JIRA_PROJECT}'
-            f' AND issuetype in ("Epic", "Story", "Bug", "Task", "Sub-task")'
+            f'issuetype in ("Epic", "Story", "Bug", "Task", "Sub-task")'
             f' AND created >= "{dash_start}" AND created <= "{dash_end}"'
             f' ORDER BY created DESC'
         )
 
-        all_issues, next_page_token = [], None
-        with st.spinner("Fetching data from Jira..."):
-            while True:
-                body = {
-                    "jql": jql,
-                    "maxResults": 100,
-                    "fields": ["summary", "issuetype", "status", "priority", "assignee", "parent", "created", "resolutiondate"],
-                }
-                if next_page_token:
-                    body["nextPageToken"] = next_page_token
-                resp = requests.post(
-                    f"{JIRA_BASE_URL}/rest/api/3/search/jql",
-                    auth=get_auth(),
-                    headers={"Accept": "application/json", "Content-Type": "application/json"},
-                    json=body,
-                    timeout=30,
-                )
-                if resp.status_code != 200:
-                    st.error(f"❌ Failed to fetch data: {resp.status_code}\n{resp.text}")
-                    st.stop()
-                raw = resp.json()
-                all_issues.extend(raw.get("issues", []))
-                next_page_token = raw.get("nextPageToken")
-                if not next_page_token or len(all_issues) >= 1000:
-                    break
+        with st.spinner(f"Fetching data from {selected_board_name}..."):
+            all_issues, err_resp = fetch_board_issues(
+                get_auth(),
+                selected_board_id,
+                jql,
+                "summary,issuetype,status,priority,assignee,parent,created,updated,resolutiondate",
+                max_results=1000,
+            )
+            if err_resp is not None:
+                st.error(f"❌ Failed to fetch data: {err_resp.status_code}\n{err_resp.text}")
+                st.stop()
 
         issues = []
+        now = datetime.now()
         for issue in all_issues:
             f = issue.get("fields", {})
             status = f.get("status", {}) or {}
+            status_name = status.get("name", "Unknown")
+            status_cat  = (status.get("statusCategory", {}) or {}).get("key")
+            updated_raw = f.get("updated")
+            updated_days = None
+            if updated_raw:
+                try:
+                    updated_days = (now - datetime.strptime(updated_raw[:19], "%Y-%m-%dT%H:%M:%S")).days
+                except ValueError:
+                    updated_days = None
+            is_blocked     = "block" in status_name.lower()
+            is_in_progress = status_cat == "indeterminate"
+            is_stale = bool(updated_days is not None and updated_days >= stale_days and (is_in_progress or is_blocked))
             issues.append({
-                "key":        issue["key"],
-                "summary":    f.get("summary"),
-                "type":       f.get("issuetype", {}).get("name") if f.get("issuetype") else "Unknown",
-                "status":     status.get("name", "Unknown"),
-                "is_done":    (status.get("statusCategory", {}) or {}).get("key") == "done",
-                "priority":   f.get("priority", {}).get("name") if f.get("priority") else "None",
-                "assignee":   f.get("assignee", {}).get("displayName") if f.get("assignee") else "Unassigned",
-                "parent":     f.get("parent", {}).get("key") if f.get("parent") else None,
-                "created":    (f.get("created") or "")[:10],
+                "key":          issue["key"],
+                "summary":      f.get("summary"),
+                "type":         f.get("issuetype", {}).get("name") if f.get("issuetype") else "Unknown",
+                "status":       status_name,
+                "is_done":      status_cat == "done",
+                "is_blocked":   is_blocked,
+                "is_stale":     is_stale,
+                "priority":     f.get("priority", {}).get("name") if f.get("priority") else "None",
+                "assignee":     f.get("assignee", {}).get("displayName") if f.get("assignee") else "Unassigned",
+                "parent":       f.get("parent", {}).get("key") if f.get("parent") else None,
+                "created":      (f.get("created") or "")[:10],
             })
 
         if not issues:
-            st.warning("⚠️ No issues found for the selected date range.")
-            st.stop()
+            st.warning("⚠️ No issues found for the selected board/date range.")
+            st.session_state.pop("dash_df", None)
+        else:
+            st.session_state["dash_df"] = pd.DataFrame(issues)
+            st.session_state["dash_board"] = selected_board_name
 
-        df = pd.DataFrame(issues)
+    if st.session_state.get("dash_df") is not None and not st.session_state["dash_df"].empty:
+        df = st.session_state["dash_df"]
 
-        epics  = df[df["type"] == "Epic"]
+        epics   = df[df["type"] == "Epic"]
         stories = df[df["type"].isin(["Story", "Bug", "Task", "Sub-task"])]
 
-        open_count   = int((~df["is_done"]).sum())
-        closed_count = int(df["is_done"].sum())
+        open_count    = int((~df["is_done"]).sum())
+        closed_count  = int(df["is_done"].sum())
+        blocked_count = int(df["is_blocked"].sum())
+        stale_count   = int(df["is_stale"].sum())
 
-        # ── KPI cards ─────────────────────────────────────────────────────
-        k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("Total Issues", len(df))
-        k2.metric("Epics", len(epics))
-        k3.metric("Stories/Tasks/Bugs", len(stories))
-        k4.metric("🟢 Open", open_count)
-        k5.metric("✅ Closed", closed_count)
+        open_epics   = int((~epics["is_done"]).sum()) if not epics.empty else 0
+        closed_epics = int(epics["is_done"].sum()) if not epics.empty else 0
+
+        # ── KPI cards — epics ─────────────────────────────────────────────
+        st.subheader("📦 Epics")
+        st.markdown(
+            '<div class="kpi-grid">'
+            f'<div class="kpi-card"><div class="kpi-label">Total epics</div><div class="kpi-value">{len(epics)}</div></div>'
+            f'<div class="kpi-card kpi-open"><div class="kpi-label">Open</div><div class="kpi-value">{open_epics}</div></div>'
+            f'<div class="kpi-card kpi-closed"><div class="kpi-label">Closed</div><div class="kpi-value">{closed_epics}</div></div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        # ── KPI cards — issues ────────────────────────────────────────────
+        st.subheader("🧾 Issues")
+        st.markdown(
+            '<div class="kpi-grid">'
+            f'<div class="kpi-card kpi-open"><div class="kpi-label">Open</div><div class="kpi-value">{open_count}</div></div>'
+            f'<div class="kpi-card kpi-stale"><div class="kpi-label">Stale ({stale_days}+ days)</div><div class="kpi-value">{stale_count}</div></div>'
+            f'<div class="kpi-card kpi-blocked"><div class="kpi-label">Blocked</div><div class="kpi-value">{blocked_count}</div></div>'
+            f'<div class="kpi-card kpi-closed"><div class="kpi-label">Closed</div><div class="kpi-value">{closed_count}</div></div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
 
         st.divider()
 
@@ -741,36 +898,92 @@ with tab4:
 
         st.divider()
 
-        # ── Epic progress ────────────────────────────────────────────────
-        st.subheader("📦 Epic Progress")
-        if epics.empty:
-            st.info("No epics found in this date range.")
+        # ── Filters ───────────────────────────────────────────────────────
+        st.subheader("Filters")
+        f1, f2, f3 = st.columns(3)
+        with f1:
+            epic_labels = {f"{e['key']} — {e['summary']}": e["key"] for _, e in epics.iterrows()}
+            epic_choice = st.selectbox("Epic", ["All epics"] + sorted(epic_labels.keys()), key="dash_epic_filter")
+        with f2:
+            # Pull assignees from ALL issues (not just epics) so every reporter/lead/assignee shows up.
+            assignee_opts = sorted(a for a in df["assignee"].dropna().unique().tolist() if a)
+            assignee_choice = st.selectbox("Assignee", ["All assignees"] + assignee_opts, key="dash_assignee_filter")
+        with f3:
+            # Pull statuses from ALL issues so To Do / In Progress / Blocked / Done etc. all appear,
+            # not just the (often single) status epics themselves sit in.
+            status_opts = sorted(s for s in df["status"].dropna().unique().tolist() if s)
+            status_choice = st.selectbox("Status", ["All statuses"] + status_opts, key="dash_status_filter")
+
+        filtered_epics = epics.copy()
+        if epic_choice != "All epics":
+            filtered_epics = filtered_epics[filtered_epics["key"] == epic_labels[epic_choice]]
+
+        st.divider()
+
+        # ── Epics overview ────────────────────────────────────────────────
+        st.subheader("Epics overview")
+        if filtered_epics.empty:
+            st.markdown('<div class="empty-state">No epics match the selected filters.</div>', unsafe_allow_html=True)
         else:
-            epic_rows = []
-            for _, epic in epics.iterrows():
+            import html as _html
+            rows_html = []
+            assignee_or_status_active = assignee_choice != "All assignees" or status_choice != "All statuses"
+            for _, epic in filtered_epics.iterrows():
                 children = df[df["parent"] == epic["key"]]
+                if assignee_choice != "All assignees":
+                    children = children[children["assignee"] == assignee_choice]
+                if status_choice != "All statuses":
+                    children = children[children["status"] == status_choice]
+                if assignee_or_status_active and children.empty:
+                    continue  # hide epics with no stories matching the assignee/status filter
+
                 total_children = len(children)
                 done_children = int(children["is_done"].sum())
                 pct = round((done_children / total_children * 100), 1) if total_children else 0.0
-                epic_rows.append({
-                    "Epic":       epic["key"],
-                    "Summary":    epic["summary"],
-                    "Status":     epic["status"],
-                    "Total Items": total_children,
-                    "Done":       done_children,
-                    "Open":       total_children - done_children,
-                    "% Complete": pct,
-                })
-            epic_df = pd.DataFrame(epic_rows)
-            st.dataframe(
-                epic_df,
-                width="stretch",
-                column_config={
-                    "% Complete": st.column_config.ProgressColumn(
-                        "% Complete", min_value=0, max_value=100, format="%.1f%%"
-                    )
-                },
-            )
+
+                # Stale/Blocked reflect the epic's child stories, matching how a lead reads epic health.
+                has_stale = bool(children["is_stale"].any()) if total_children else False
+                has_blocked = bool(children["is_blocked"].any()) if total_children else False
+
+                border_class = "stale-left-border" if has_stale else ("blocked-left-border" if has_blocked else "")
+                badges = ""
+                if has_stale:
+                    badges += '<span class="badge badge-stale">Stale</span>'
+                if has_blocked:
+                    badges += '<span class="badge badge-blocked">Blocked</span>'
+
+                if pct >= 100:
+                    fill_class = "progress-fill-done"
+                elif pct >= 50:
+                    fill_class = "progress-fill-in-progress"
+                else:
+                    fill_class = "progress-fill-pending"
+
+                summary = _html.escape(str(epic["summary"] or ""))
+                lead = _html.escape(str(epic["assignee"] or "Unassigned"))
+                badges_html = f'<div class="epic-badges">{badges}</div>' if badges else ""
+
+                rows_html.append(
+                    f'<div class="epic-row {border_class}">'
+                    f'<div class="epic-header">'
+                    f'<div style="flex:1;">'
+                    f'<div class="epic-title">{summary}</div>'
+                    f'{badges_html}'
+                    f'<div class="epic-meta">{total_children} stories • Lead: {lead}</div>'
+                    f'</div>'
+                    f'<div class="epic-completion">'
+                    f'<div class="epic-percentage">{pct:.0f}%</div>'
+                    f'<div class="epic-done">{done_children} of {total_children} done</div>'
+                    f'</div>'
+                    f'</div>'
+                    f'<div class="progress-bar"><div class="progress-fill {fill_class}" style="width:{pct:.0f}%;"></div></div>'
+                    f'</div>'
+                )
+
+            if not rows_html:
+                st.markdown('<div class="empty-state">No epics match the selected filters.</div>', unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div class="epics-overview">{"".join(rows_html)}</div>', unsafe_allow_html=True)
 
         st.divider()
 
