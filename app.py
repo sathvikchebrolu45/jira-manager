@@ -61,6 +61,7 @@ st.markdown("""
 .epic-row.blocked-left-border { border-left: 3px solid #ef4444; padding-left: 12px; }
 .epic-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
 .epic-title { font-weight: 600; font-size: 15px; margin-bottom: 4px; }
+.epic-title a:hover { text-decoration: underline !important; }
 .epic-badges { margin-top: 6px; margin-bottom: 4px; }
 .epic-meta { font-size: 13px; opacity: 0.65; margin-top: 4px; }
 .epic-completion { text-align: right; min-width: 90px; }
@@ -1028,12 +1029,13 @@ with tab4:
                 summary = _html.escape(str(epic["summary"] or ""))
                 lead = _html.escape(str(epic["assignee"] or "Unassigned"))
                 badges_html = f'<div class="epic-badges">{badges}</div>' if badges else ""
+                epic_url = f"{JIRA_BASE_URL}/browse/{epic['key']}"
 
                 rows_html.append(
                     f'<div class="epic-row {border_class}">'
                     f'<div class="epic-header">'
                     f'<div style="flex:1;">'
-                    f'<div class="epic-title">{summary}</div>'
+                    f'<div class="epic-title"><a href="{epic_url}" target="_blank" rel="noopener noreferrer" style="color:inherit; text-decoration:none;">{summary}</a></div>'
                     f'{badges_html}'
                     f'<div class="epic-meta">{total_children} stories • Lead: {lead}</div>'
                     f'</div>'
