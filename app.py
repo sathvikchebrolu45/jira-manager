@@ -158,6 +158,44 @@ st.sidebar.caption(f"[🔗 Open board]({board_url})")
 def get_auth():
     return HTTPBasicAuth(jira_email, jira_token)
 
+def adf_to_text(node):
+    """Flatten an Atlassian Document Format (ADF) body into plain text."""
+    if not node:
+        return ""
+    parts = []
+
+    def walk(n):
+        if isinstance(n, dict):
+            if n.get("type") == "text":
+                parts.append(n.get("text", ""))
+            for child in n.get("content", []) or []:
+                walk(child)
+        elif isinstance(n, list):
+            for item in n:
+                walk(item)
+
+    walk(node)
+    return " ".join(p for p in parts if p).strip()
+
+def fetch_issue_comments(auth, key):
+    resp = requests.get(
+        f"{JIRA_BASE_URL}/rest/api/3/issue/{key}/comment",
+        auth=auth,
+        headers={"Accept": "application/json"},
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        return []
+    out = []
+    for c in resp.json().get("comments", []):
+        out.append({
+            "key":     key,
+            "author":  (c.get("author") or {}).get("displayName", ""),
+            "created": (c.get("created") or "")[:10],
+            "text":    adf_to_text(c.get("body")),
+        })
+    return out
+
 def fetch_board_issues(auth, board_id, jql_clause, fields, max_results=1000):
     """Fetch issues for the given board_id (agile board API), or across the whole
     project when board_id is None (the "All Boards" selection), paginating either way.
@@ -581,6 +619,12 @@ with tab2:
         help="Only fetch child issues under this parent/epic key. Leave empty to fetch all.",
     )
 
+    include_comments = st.checkbox(
+        "💬 Also pull comments for each issue",
+        value=False,
+        help="Fetches all comments per issue via an extra API call each — slower for large result sets.",
+    )
+
     if st.button("🔄 Sync Jira Data", type="primary", width="stretch"):
         if not validate_credentials():
             st.stop()
@@ -635,11 +679,33 @@ with tab2:
 
         st.success(f"✅ Fetched {len(issues)} matching issues on **{selected_board_name}**.")
 
+        comments_by_key = {}
+        all_comments = []
+        if include_comments and issues:
+            with st.spinner(f"Fetching comments for {len(issues)} issue(s)..."):
+                for i in issues:
+                    c = fetch_issue_comments(get_auth(), i["key"])
+                    comments_by_key[i["key"]] = c
+                    all_comments.extend(c)
+            for i in issues:
+                i["comments"] = comments_by_key.get(i["key"], [])
+            st.success(f"✅ Fetched {len(all_comments)} comment(s) across {len(issues)} issue(s).")
+
         # Summary table
         if issues:
             import pandas as pd
-            df = pd.DataFrame(issues)[["key", "summary", "issuetype", "status", "priority", "assignee", "created"]]
-            st.dataframe(df, width="stretch")
+            summary_cols = ["key", "summary", "issuetype", "status", "priority", "assignee", "created"]
+            df = pd.DataFrame(issues)
+            if include_comments:
+                def _join_comments(k):
+                    return "\n".join(f"{c['author']} ({c['created']}): {c['text']}" for c in comments_by_key.get(k, []))
+                df["comments"] = df["key"].map(_join_comments)
+                summary_cols = summary_cols + ["comments"]
+            st.dataframe(df[summary_cols], width="stretch", row_height=100)
+
+        if include_comments and all_comments:
+            with st.expander(f"💬 Comments ({len(all_comments)})", expanded=False):
+                st.dataframe(pd.DataFrame(all_comments)[["key", "author", "created", "text"]], width="stretch", row_height=100)
 
         # JSON output
         with st.expander("🗂️ Full JSON Output", expanded=True):

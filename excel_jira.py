@@ -95,6 +95,72 @@ def auth(email, token):
 
 # ── Story Points Field ─────────────────────────────────────────────────────────
 
+def adf_to_text(node):
+    """Flatten an Atlassian Document Format (ADF) body into plain text."""
+    if not node:
+        return ""
+    parts = []
+
+    def walk(n):
+        if isinstance(n, dict):
+            if n.get("type") == "text":
+                parts.append(n.get("text", ""))
+            for child in n.get("content", []) or []:
+                walk(child)
+        elif isinstance(n, list):
+            for item in n:
+                walk(item)
+
+    walk(node)
+    return " ".join(p for p in parts if p).strip()
+
+
+def fetch_issue_comments(email, token, key):
+    resp = requests.get(
+        f"{JIRA_BASE_URL}/rest/api/3/issue/{key}/comment",
+        auth=auth(email, token),
+        headers={"Accept": "application/json"},
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        return []
+    out = []
+    for c in resp.json().get("comments", []):
+        out.append({
+            "Key":     key,
+            "Author":  (c.get("author") or {}).get("displayName", ""),
+            "Created": (c.get("created") or "")[:10],
+            "Text":    adf_to_text(c.get("body")),
+        })
+    return out
+
+
+def fetch_issue_changelog(email, token, key):
+    resp = requests.get(
+        f"{JIRA_BASE_URL}/rest/api/3/issue/{key}",
+        params={"expand": "changelog"},
+        auth=auth(email, token),
+        headers={"Accept": "application/json"},
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        return []
+    out = []
+    for h in resp.json().get("changelog", {}).get("histories", []):
+        author  = (h.get("author") or {}).get("displayName", "")
+        created = (h.get("created") or "")[:10]
+        for item in h.get("items", []):
+            out.append({
+                "Key":     key,
+                "Author":  author,
+                "Created": created,
+                "Field":   item.get("field", ""),
+                "From":    item.get("fromString") or "",
+                "To":      item.get("toString") or "",
+            })
+    return out
+
+
 def get_story_points_field(email, token):
     resp = requests.get(
         f"{JIRA_BASE_URL}/rest/api/3/field",
@@ -335,6 +401,7 @@ def sync_jira_to_excel(email, token):
                           default=[]),
         inquirer.Text("parent",   message="Filter by Parent Issue (optional)", default=""),
         inquirer.Text("max",      message="Max results", default="100"),
+        inquirer.Confirm("comments", message="Also pull comments for each issue?", default=False),
         inquirer.Text("file",     message="Save to Excel file", default=f"jira_sync_{today}.xlsx"),
     ])
 
@@ -390,6 +457,13 @@ def sync_jira_to_excel(email, token):
         console.print("[yellow]No issues to write.[/yellow]")
         return
 
+    comments = []
+    if ans["comments"]:
+        with console.status("Fetching comments..."):
+            for issue in issues:
+                comments.extend(fetch_issue_comments(email, token, issue["Key"]))
+        console.print(f"[green]✅ Fetched {len(comments)} comment(s) across {len(issues)} issue(s).[/green]")
+
     # Write to Excel
     filename = ans["file"]
     if not filename.endswith(".xlsx"):
@@ -426,8 +500,30 @@ def sync_jira_to_excel(email, token):
             if r_idx % 2 == 0:
                 cell.fill = row_fill_even
 
+    if ans["comments"]:
+        comments_sheet_name = f"Comments {ans['start']}"[:31]
+        if comments_sheet_name in wb.sheetnames:
+            del wb[comments_sheet_name]
+        cws = wb.create_sheet(title=comments_sheet_name)
+
+        c_headers = ["Key", "Author", "Created", "Text"]
+        for col, h in enumerate(c_headers, 1):
+            cell = cws.cell(row=1, column=col, value=h)
+            cell.fill  = header_fill
+            cell.font  = header_font
+            cell.alignment = Alignment(horizontal="center")
+            cws.column_dimensions[cell.column_letter].width = 20 if h != "Text" else 60
+
+        for r_idx, comment in enumerate(comments, 2):
+            for c_idx, key in enumerate(c_headers, 1):
+                cell = cws.cell(row=r_idx, column=c_idx, value=comment[key])
+                if r_idx % 2 == 0:
+                    cell.fill = row_fill_even
+
     wb.save(filename)
     console.print(f"[green]✅ Jira data saved to:[/green] {filename} (sheet: '{sheet_name}')")
+    if ans["comments"]:
+        console.print(f"[green]✅ Comments saved to sheet:[/green] '{comments_sheet_name}'")
 
 
 # ── Main Menu ──────────────────────────────────────────────────────────────────
