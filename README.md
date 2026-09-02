@@ -1,7 +1,7 @@
 # Jira Manager
 
 A local toolkit for managing Jira tickets for the **MID1** project — with both a
-Streamlit web dashboard and a CLI, plus Excel import/export helpers.
+Streamlit web dashboard and Excel import/export helpers.
 
 ## Features
 
@@ -14,7 +14,6 @@ Streamlit web dashboard and a CLI, plus Excel import/export helpers.
   and open workload by assignee
 - **excel_jira.py** — standalone CLI for generating templates, bulk-creating
   stories from Excel, and syncing Jira data back to Excel
-- **cli.py** — additional command-line Jira utilities
 
 ## Requirements
 
